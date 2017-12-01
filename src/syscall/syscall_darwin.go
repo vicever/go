@@ -53,7 +53,7 @@ func nametomib(name string) (mib []_C_int, err error) {
 
 	// NOTE(rsc): It seems strange to set the buffer to have
 	// size CTL_MAXNAME+2 but use only CTL_MAXNAME
-	// as the size.  I don't know why the +2 is here, but the
+	// as the size. I don't know why the +2 is here, but the
 	// kernel uses +2 for its own implementation of this function.
 	// I am scared that if we don't include the +2 here, the kernel
 	// will silently write 2 words farther than we specify
@@ -75,32 +75,16 @@ func nametomib(name string) (mib []_C_int, err error) {
 	return buf[0 : n/siz], nil
 }
 
-// ParseDirent parses up to max directory entries in buf,
-// appending the names to names.  It returns the number
-// bytes consumed from buf, the number of entries added
-// to names, and the new names slice.
-func ParseDirent(buf []byte, max int, names []string) (consumed int, count int, newnames []string) {
-	origlen := len(buf)
-	for max != 0 && len(buf) > 0 {
-		dirent := (*Dirent)(unsafe.Pointer(&buf[0]))
-		if dirent.Reclen == 0 {
-			buf = nil
-			break
-		}
-		buf = buf[dirent.Reclen:]
-		if dirent.Ino == 0 { // File absent in directory.
-			continue
-		}
-		bytes := (*[10000]byte)(unsafe.Pointer(&dirent.Name[0]))
-		var name = string(bytes[0:dirent.Namlen])
-		if name == "." || name == ".." { // Useless names
-			continue
-		}
-		max--
-		count++
-		names = append(names, name)
-	}
-	return origlen - len(buf), count, names
+func direntIno(buf []byte) (uint64, bool) {
+	return readInt(buf, unsafe.Offsetof(Dirent{}.Ino), unsafe.Sizeof(Dirent{}.Ino))
+}
+
+func direntReclen(buf []byte) (uint64, bool) {
+	return readInt(buf, unsafe.Offsetof(Dirent{}.Reclen), unsafe.Sizeof(Dirent{}.Reclen))
+}
+
+func direntNamlen(buf []byte) (uint64, bool) {
+	return readInt(buf, unsafe.Offsetof(Dirent{}.Namlen), unsafe.Sizeof(Dirent{}.Namlen))
 }
 
 //sys   ptrace(request int, pid int, addr uintptr, data uintptr) (err error)
@@ -109,6 +93,8 @@ func PtraceDetach(pid int) (err error) { return ptrace(PT_DETACH, pid, 0, 0) }
 
 const (
 	attrBitMapCount = 5
+	attrCmnModtime  = 0x00000400
+	attrCmnAcctime  = 0x00001000
 	attrCmnFullpath = 0x08000000
 )
 
@@ -143,7 +129,6 @@ func getAttrList(path string, attrList attrList, attrBuf []byte, options uint) (
 		uintptr(options),
 		0,
 	)
-	use(unsafe.Pointer(_p0))
 	if e1 != 0 {
 		return nil, e1
 	}
@@ -203,6 +188,39 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 	return
 }
 
+func setattrlistTimes(path string, times []Timespec) error {
+	_p0, err := BytePtrFromString(path)
+	if err != nil {
+		return err
+	}
+
+	var attrList attrList
+	attrList.bitmapCount = attrBitMapCount
+	attrList.CommonAttr = attrCmnModtime | attrCmnAcctime
+
+	// order is mtime, atime: the opposite of Chtimes
+	attributes := [2]Timespec{times[1], times[0]}
+	const options = 0
+	_, _, e1 := Syscall6(
+		SYS_SETATTRLIST,
+		uintptr(unsafe.Pointer(_p0)),
+		uintptr(unsafe.Pointer(&attrList)),
+		uintptr(unsafe.Pointer(&attributes)),
+		uintptr(unsafe.Sizeof(attributes)),
+		uintptr(options),
+		0,
+	)
+	if e1 != 0 {
+		return e1
+	}
+	return nil
+}
+
+func utimensat(dirfd int, path string, times *[2]Timespec, flag int) error {
+	// Darwin doesn't support SYS_UTIMENSAT
+	return ENOSYS
+}
+
 /*
  * Wrapped
  */
@@ -225,7 +243,6 @@ func Kill(pid int, signum Signal) (err error) { return kill(pid, int(signum), 1)
 //sys	Dup(fd int) (nfd int, err error)
 //sys	Dup2(from int, to int) (err error)
 //sys	Exchangedata(path1 string, path2 string, options int) (err error)
-//sys	Exit(code int)
 //sys	Fchdir(fd int) (err error)
 //sys	Fchflags(fd int, flags int) (err error)
 //sys	Fchmod(fd int, mode uint32) (err error)

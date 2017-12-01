@@ -32,7 +32,9 @@
 #define SYS_getrlimit		163
 #define SYS_madvise		233
 #define SYS_mincore		232
+#define SYS_getpid		172
 #define SYS_gettid		178
+#define SYS_kill		129
 #define SYS_tkill		130
 #define SYS_futex		98
 #define SYS_sched_getaffinity	123
@@ -41,6 +43,10 @@
 #define SYS_epoll_ctl		21
 #define SYS_epoll_pwait		22
 #define SYS_clock_gettime	113
+#define SYS_faccessat		48
+#define SYS_socket		198
+#define SYS_connect		203
+#define SYS_brk			214
 
 TEXT runtime·exit(SB),NOSPLIT,$-8-4
 	MOVW	code+0(FP), R0
@@ -48,11 +54,16 @@ TEXT runtime·exit(SB),NOSPLIT,$-8-4
 	SVC
 	RET
 
-TEXT runtime·exit1(SB),NOSPLIT,$-8-4
-	MOVW	code+0(FP), R0
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$-8-8
+	MOVD	wait+0(FP), R0
+	// We're done using the stack.
+	MOVW	$0, R1
+	STLRW	R1, (R0)
+	MOVW	$0, R0	// exit code
 	MOVD	$SYS_exit, R8
 	SVC
-	RET
+	JMP	0(PC)
 
 TEXT runtime·open(SB),NOSPLIT,$-8-20
 	MOVD	$AT_FDCWD, R0
@@ -113,7 +124,7 @@ TEXT runtime·getrlimit(SB),NOSPLIT,$-8-20
 	MOVW	R0, ret+16(FP)
 	RET
 
-TEXT runtime·usleep(SB),NOSPLIT,$16-4
+TEXT runtime·usleep(SB),NOSPLIT,$24-4
 	MOVWU	usec+0(FP), R3
 	MOVD	R3, R5
 	MOVW	$1000000, R4
@@ -136,12 +147,27 @@ TEXT runtime·usleep(SB),NOSPLIT,$16-4
 	SVC
 	RET
 
+TEXT runtime·gettid(SB),NOSPLIT,$0-4
+	MOVD	$SYS_gettid, R8
+	SVC
+	MOVW	R0, ret+0(FP)
+	RET
+
 TEXT runtime·raise(SB),NOSPLIT,$-8
 	MOVD	$SYS_gettid, R8
 	SVC
 	MOVW	R0, R0	// arg 1 tid
 	MOVW	sig+0(FP), R1	// arg 2
 	MOVD	$SYS_tkill, R8
+	SVC
+	RET
+
+TEXT runtime·raiseproc(SB),NOSPLIT,$-8
+	MOVD	$SYS_getpid, R8
+	SVC
+	MOVW	R0, R0		// arg 1 pid
+	MOVW	sig+0(FP), R1	// arg 2
+	MOVD	$SYS_kill, R8
 	SVC
 	RET
 
@@ -162,21 +188,19 @@ TEXT runtime·mincore(SB),NOSPLIT,$-8-28
 	MOVW	R0, ret+24(FP)
 	RET
 
-// func now() (sec int64, nsec int32)
-TEXT time·now(SB),NOSPLIT,$16-12
-	MOVD	RSP, R0
-	MOVD	$0, R1
-	MOVD	$SYS_gettimeofday, R8
+// func walltime() (sec int64, nsec int32)
+TEXT runtime·walltime(SB),NOSPLIT,$24-12
+	MOVW	$0, R0 // CLOCK_REALTIME
+	MOVD	RSP, R1
+	MOVD	$SYS_clock_gettime, R8
 	SVC
 	MOVD	0(RSP), R3	// sec
-	MOVD	8(RSP), R5	// usec
-	MOVD	$1000, R4
-	MUL	R4, R5
+	MOVD	8(RSP), R5	// nsec
 	MOVD	R3, sec+0(FP)
 	MOVW	R5, nsec+8(FP)
 	RET
 
-TEXT runtime·nanotime(SB),NOSPLIT,$16-8
+TEXT runtime·nanotime(SB),NOSPLIT,$24-8
 	MOVW	$1, R0 // CLOCK_MONOTONIC
 	MOVD	RSP, R1
 	MOVD	$SYS_clock_gettime, R8
@@ -192,7 +216,7 @@ TEXT runtime·nanotime(SB),NOSPLIT,$16-8
 	RET
 
 TEXT runtime·rtsigprocmask(SB),NOSPLIT,$-8-28
-	MOVW	sig+0(FP), R0
+	MOVW	how+0(FP), R0
 	MOVD	new+8(FP), R1
 	MOVD	old+16(FP), R2
 	MOVW	size+24(FP), R3
@@ -239,6 +263,10 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$24
 	BL	(R0)
 	RET
 
+TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
+	MOVD	$runtime·sigtramp(SB), R3
+	B	(R3)
+
 TEXT runtime·mmap(SB),NOSPLIT,$-8
 	MOVD	addr+0(FP), R0
 	MOVD	n+8(FP), R1
@@ -249,7 +277,15 @@ TEXT runtime·mmap(SB),NOSPLIT,$-8
 
 	MOVD	$SYS_mmap, R8
 	SVC
-	MOVD	R0, ret+32(FP)
+	CMN	$4095, R0
+	BCC	ok
+	NEG	R0,R0
+	MOVD	$0, p+32(FP)
+	MOVD	R0, err+40(FP)
+	RET
+ok:
+	MOVD	R0, p+32(FP)
+	MOVD	$0, err+40(FP)
 	RET
 
 TEXT runtime·munmap(SB),NOSPLIT,$-8
@@ -292,8 +328,8 @@ TEXT runtime·clone(SB),NOSPLIT,$-8
 	MOVD	stk+8(FP), R1
 
 	// Copy mp, gp, fn off parent stack for use by child.
-	MOVD	mm+16(FP), R10
-	MOVD	gg+24(FP), R11
+	MOVD	mp+16(FP), R10
+	MOVD	gp+24(FP), R11
 	MOVD	fn+32(FP), R12
 
 	MOVD	R10, -8(R1)
@@ -427,4 +463,43 @@ TEXT runtime·closeonexec(SB),NOSPLIT,$-8
 	MOVD	$1, R2	// FD_CLOEXEC
 	MOVD	$SYS_fcntl, R8
 	SVC
+	RET
+
+// int access(const char *name, int mode)
+TEXT runtime·access(SB),NOSPLIT,$0-20
+	MOVD	$AT_FDCWD, R0
+	MOVD	name+0(FP), R1
+	MOVW	mode+8(FP), R2
+	MOVD	$SYS_faccessat, R8
+	SVC
+	MOVW	R0, ret+16(FP)
+	RET
+
+// int connect(int fd, const struct sockaddr *addr, socklen_t len)
+TEXT runtime·connect(SB),NOSPLIT,$0-28
+	MOVW	fd+0(FP), R0
+	MOVD	addr+8(FP), R1
+	MOVW	len+16(FP), R2
+	MOVD	$SYS_connect, R8
+	SVC
+	MOVW	R0, ret+24(FP)
+	RET
+
+// int socket(int domain, int typ, int prot)
+TEXT runtime·socket(SB),NOSPLIT,$0-20
+	MOVW	domain+0(FP), R0
+	MOVW	typ+4(FP), R1
+	MOVW	prot+8(FP), R2
+	MOVD	$SYS_socket, R8
+	SVC
+	MOVW	R0, ret+16(FP)
+	RET
+
+// func sbrk0() uintptr
+TEXT runtime·sbrk0(SB),NOSPLIT,$0-8
+	// Implemented as brk(NULL).
+	MOVD	$0, R0
+	MOVD	$SYS_brk, R8
+	SVC
+	MOVD	R0, ret+0(FP)
 	RET

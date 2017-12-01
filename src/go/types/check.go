@@ -8,7 +8,7 @@ package types
 
 import (
 	"go/ast"
-	exact "go/constant" // Renamed to reduce diffs from x/tools.  TODO: remove
+	"go/constant"
 	"go/token"
 )
 
@@ -36,7 +36,7 @@ type exprInfo struct {
 	isLhs bool // expression is lhs operand of a shift with delayed type-check
 	mode  operandMode
 	typ   *Basic
-	val   exact.Value // constant value; or nil (if not a constant)
+	val   constant.Value // constant value; or nil (if not a constant)
 }
 
 // funcInfo stores the information required for type-checking a function.
@@ -49,12 +49,22 @@ type funcInfo struct {
 
 // A context represents the context within which an object is type-checked.
 type context struct {
-	decl          *declInfo   // package-level declaration whose init expression/function body is checked
-	scope         *Scope      // top-most scope for lookups
-	iota          exact.Value // value of iota in a constant declaration; nil otherwise
-	sig           *Signature  // function signature if inside a function; nil otherwise
-	hasLabel      bool        // set if a function makes use of labels (only ~1% of functions); unused outside functions
-	hasCallOrRecv bool        // set if an expression contains a function call or channel receive operation
+	decl          *declInfo      // package-level declaration whose init expression/function body is checked
+	scope         *Scope         // top-most scope for lookups
+	iota          constant.Value // value of iota in a constant declaration; nil otherwise
+	sig           *Signature     // function signature if inside a function; nil otherwise
+	hasLabel      bool           // set if a function makes use of labels (only ~1% of functions); unused outside functions
+	hasCallOrRecv bool           // set if an expression contains a function call or channel receive operation
+}
+
+// An importKey identifies an imported package by import path and source directory
+// (directory containing the file containing the import). In practice, the directory
+// may always be the same, or may not matter. Given an (import path, directory), an
+// importer must always return the same package (but given two different import paths,
+// an importer may still return the same package by mapping them to the same package
+// paths).
+type importKey struct {
+	path, dir string
 }
 
 // A Checker maintains the state of the type checker.
@@ -66,7 +76,8 @@ type Checker struct {
 	fset *token.FileSet
 	pkg  *Package
 	*Info
-	objMap map[Object]*declInfo // maps package-level object to declaration info
+	objMap map[Object]*declInfo   // maps package-level object to declaration info
+	impMap map[importKey]*Package // maps (import path, source directory) to (complete or fake) package
 
 	// information collected during type-checking of a set of package files
 	// (initialized by Files, valid only for the duration of check.Files;
@@ -83,6 +94,7 @@ type Checker struct {
 	// context within which the current object is type-checked
 	// (valid only for the duration of type-checking a specific object)
 	context
+	pos token.Pos // if valid, identifiers are looked up as if at position pos (used by Eval)
 
 	// debugging
 	indent int // indentation for tracing
@@ -125,7 +137,7 @@ func (check *Checker) assocMethod(tname string, meth *Func) {
 	m[tname] = append(m[tname], meth)
 }
 
-func (check *Checker) rememberUntyped(e ast.Expr, lhs bool, mode operandMode, typ *Basic, val exact.Value) {
+func (check *Checker) rememberUntyped(e ast.Expr, lhs bool, mode operandMode, typ *Basic, val constant.Value) {
 	m := check.untyped
 	if m == nil {
 		m = make(map[ast.Expr]exprInfo)
@@ -161,6 +173,7 @@ func NewChecker(conf *Config, fset *token.FileSet, pkg *Package, info *Info) *Ch
 		pkg:    pkg,
 		Info:   info,
 		objMap: make(map[Object]*declInfo),
+		impMap: make(map[importKey]*Package),
 	}
 }
 
@@ -214,7 +227,9 @@ func (check *Checker) handleBailout(err *error) {
 }
 
 // Files checks the provided files as part of the checker's package.
-func (check *Checker) Files(files []*ast.File) (err error) {
+func (check *Checker) Files(files []*ast.File) error { return check.checkFiles(files) }
+
+func (check *Checker) checkFiles(files []*ast.File) (err error) {
 	defer check.handleBailout(&err)
 
 	check.initFiles(files)
@@ -256,14 +271,14 @@ func (check *Checker) recordUntyped() {
 	}
 }
 
-func (check *Checker) recordTypeAndValue(x ast.Expr, mode operandMode, typ Type, val exact.Value) {
+func (check *Checker) recordTypeAndValue(x ast.Expr, mode operandMode, typ Type, val constant.Value) {
 	assert(x != nil)
 	assert(typ != nil)
 	if mode == invalid {
 		return // omit
 	}
 	assert(typ != nil)
-	if mode == constant {
+	if mode == constant_ {
 		assert(val != nil)
 		assert(typ == Typ[Invalid] || isConstType(typ))
 	}
@@ -342,7 +357,6 @@ func (check *Checker) recordImplicit(node ast.Node, obj Object) {
 func (check *Checker) recordSelection(x *ast.SelectorExpr, kind SelectionKind, recv Type, obj Object, index []int, indirect bool) {
 	assert(obj != nil && (recv == nil || len(index) > 0))
 	check.recordUse(x.Sel, obj)
-	// TODO(gri) Should we also call recordTypeAndValue?
 	if m := check.Selections; m != nil {
 		m[x] = &Selection{kind, recv, obj, index, indirect}
 	}

@@ -1,4 +1,4 @@
-// Copyright 2011 The Go Authors.  All rights reserved.
+// Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -18,9 +18,9 @@ import (
 // The fact that it is partial is very important: the input is
 // an AST and a description of some type information to
 // assume about one or more packages, but not all the
-// packages that the program imports.  The checker is
+// packages that the program imports. The checker is
 // expected to do as much as it can with what it has been
-// given.  There is not enough information supplied to do
+// given. There is not enough information supplied to do
 // a full type check, but the type checker is expected to
 // apply information that can be derived from variable
 // declarations, function and method returns, and type switches
@@ -30,14 +30,14 @@ import (
 // TODO(rsc,gri): Replace with go/typechecker.
 // Doing that could be an interesting test case for go/typechecker:
 // the constraints about working with partial information will
-// likely exercise it in interesting ways.  The ideal interface would
+// likely exercise it in interesting ways. The ideal interface would
 // be to pass typecheck a map from importpath to package API text
 // (Go source code), but for now we use data structures (TypeConfig, Type).
 //
 // The strings mostly use gofmt form.
 //
 // A Field or FieldList has as its type a comma-separated list
-// of the types of the fields.  For example, the field list
+// of the types of the fields. For example, the field list
 //	x, y, z int
 // has type "int, int, int".
 
@@ -242,7 +242,7 @@ func typecheck1(cfg *TypeConfig, f interface{}, typeof map[interface{}]string, a
 		// propagate the type to all the uses.
 		// The !isDecl case is a cheat here, but it makes
 		// up in some cases for not paying attention to
-		// struct fields.  The real type checker will be
+		// struct fields. The real type checker will be
 		// more accurate so we won't need the cheat.
 		if id, ok := n.(*ast.Ident); ok && id.Obj != nil && (isDecl || typeof[id.Obj] == "") {
 			typeof[id.Obj] = typ
@@ -367,7 +367,7 @@ func typecheck1(cfg *TypeConfig, f interface{}, typeof map[interface{}]string, a
 			typeof[n] = all
 
 		case *ast.ValueSpec:
-			// var declaration.  Use type if present.
+			// var declaration. Use type if present.
 			if n.Type != nil {
 				t := typeof[n.Type]
 				if !isType(t) {
@@ -498,6 +498,50 @@ func typecheck1(cfg *TypeConfig, f interface{}, typeof map[interface{}]string, a
 			// T{...} has type T.
 			typeof[n] = gofmt(n.Type)
 
+			// Propagate types down to values used in the composite literal.
+			t := expand(typeof[n])
+			if strings.HasPrefix(t, "[") { // array or slice
+				// Lazy: assume there are no nested [] in the array length.
+				if i := strings.Index(t, "]"); i >= 0 {
+					et := t[i+1:]
+					for _, e := range n.Elts {
+						if kv, ok := e.(*ast.KeyValueExpr); ok {
+							e = kv.Value
+						}
+						if typeof[e] == "" {
+							typeof[e] = et
+						}
+					}
+				}
+			}
+			if strings.HasPrefix(t, "map[") { // map
+				// Lazy: assume there are no nested [] in the map key type.
+				if i := strings.Index(t, "]"); i >= 0 {
+					kt, vt := t[4:i], t[i+1:]
+					for _, e := range n.Elts {
+						if kv, ok := e.(*ast.KeyValueExpr); ok {
+							if typeof[kv.Key] == "" {
+								typeof[kv.Key] = kt
+							}
+							if typeof[kv.Value] == "" {
+								typeof[kv.Value] = vt
+							}
+						}
+					}
+				}
+			}
+			if typ := cfg.Type[t]; typ != nil && len(typ.Field) > 0 { // struct
+				for _, e := range n.Elts {
+					if kv, ok := e.(*ast.KeyValueExpr); ok {
+						if ft := typ.Field[fmt.Sprintf("%s", kv.Key)]; ft != "" {
+							if typeof[kv.Value] == "" {
+								typeof[kv.Value] = ft
+							}
+						}
+					}
+				}
+			}
+
 		case *ast.ParenExpr:
 			// (x) has type of x.
 			typeof[n] = typeof[n.X]
@@ -579,6 +623,18 @@ func typecheck1(cfg *TypeConfig, f interface{}, typeof map[interface{}]string, a
 					set(res[i], t[i], false)
 				}
 			}
+
+		case *ast.BinaryExpr:
+			// Propagate types across binary ops that require two args of the same type.
+			switch n.Op {
+			case token.EQL, token.NEQ: // TODO: more cases. This is enough for the cftype fix.
+				if typeof[n.X] != "" && typeof[n.Y] == "" {
+					typeof[n.Y] = typeof[n.X]
+				}
+				if typeof[n.X] == "" && typeof[n.Y] != "" {
+					typeof[n.X] = typeof[n.Y]
+				}
+			}
 		}
 	}
 	walkBeforeAfter(f, before, after)
@@ -586,7 +642,7 @@ func typecheck1(cfg *TypeConfig, f interface{}, typeof map[interface{}]string, a
 
 // Convert between function type strings and lists of types.
 // Using strings makes this a little harder, but it makes
-// a lot of the rest of the code easier.  This will all go away
+// a lot of the rest of the code easier. This will all go away
 // when we can use go/typechecker directly.
 
 // splitFunc splits "func(x,y,z) (a,b,c)" into ["x", "y", "z"] and ["a", "b", "c"].
